@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/includes/bootstrap.php';
 require_login();
+require_once __DIR__ . '/includes/InventoryDSA.php';
 
 $pageTitle = 'Point of Sale';
 $error = '';
@@ -29,10 +30,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
         $items = [];
         $subtotal = 0;
+        $postfixProfit = new PostfixProfitEvaluator(); // B5: actual profit evaluation when recording a sale.
+        $transactionGrossProfit = 0.0;
 
         $findProduct = $pdo->prepare("
             SELECT id, name, cost_price, selling_price, stock_qty,
-                   DATEDIFF(expiration_date, CURDATE()) AS days_left
+                DATEDIFF(expiration_date, CURDATE()) AS days_left
             FROM products
             WHERE id = ? AND active = 1
             FOR UPDATE
@@ -59,6 +62,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $lineTotal = round($quantity * (float) $product['selling_price'], 2);
             $subtotal += $lineTotal;
+            $transactionGrossProfit += $postfixProfit->lineProfit((float)$product['selling_price'], (float)$product['cost_price'], $quantity);
             $items[] = [
                 'product' => $product,
                 'quantity' => $quantity,
@@ -124,6 +128,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
         }
 
+        // Profit for the sale before discount is evaluated via postfix; no schema change required.
         log_action($pdo, 'create', 'sale', $saleId, $transactionNo);
         $pdo->commit();
 
@@ -146,6 +151,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 require __DIR__ . '/includes/header.php';
 ?>
 <div class="pos-layout"><section class="panel pos-products"><div class="panel-heading"><div><h3>Choose products</h3><p>Tap a product to add it to the cart.</p></div><span class="subtle-tag"><?= count($products) ?> available</span></div><input id="productSearch" class="search-wide" placeholder="Search products by name or SKU…"><div class="pos-product-grid" id="posProductGrid"><?php foreach($products as $p): ?><button type="button" class="pos-product" data-id="<?= $p['id'] ?>" data-name="<?= e($p['name']) ?>" data-sku="<?= e($p['sku']??'') ?>" data-price="<?= e((string)$p['selling_price']) ?>" data-stock="<?= e((string)$p['stock_qty']) ?>" data-unit="<?= e($p['unit']) ?>"><span class="pos-product-icon"><?= e(strtoupper(substr($p['name'],0,1))) ?></span><strong><?= e($p['name']) ?></strong><small><?= money($p['selling_price']) ?> / <?= e($p['unit']) ?></small><span class="stock-hint"><?= e((string)$p['stock_qty']) ?> <?= e($p['unit']) ?> available</span></button><?php endforeach; ?></div><p id="noProducts" class="muted hidden">No matching products found.</p></section>
-<section class="panel cart-panel"><div class="panel-heading"><div><h3>Current sale</h3><p>Review items before checkout.</p></div><button type="button" id="clearCart" class="btn ghost small">Clear</button></div><?php if(!empty($error)): ?><div class="alert error"><?= e($error) ?></div><?php endif; ?><form method="post" id="checkoutForm"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><div id="cartItems" class="cart-items"><div class="empty-state compact"><div>＋</div><strong>Your cart is empty</strong><p>Select products to start a sale.</p></div></div><div id="hiddenCart"></div><div class="cart-summary"><div><span>Subtotal</span><strong id="subtotalDisplay">₱0.00</strong></div><div class="discount-line"><label for="discount">Discount (₱)</label><input id="discount" name="discount" type="number" min="0" step="0.01" value="0"></div><div class="total-line"><span>Total due</span><strong id="totalDisplay">₱0.00</strong></div><label for="cashReceived">Cash received (₱)</label><input id="cashReceived" name="cash_received" type="number" min="0" step="0.01" required placeholder="Enter amount received"><div class="change-line"><span>Change</span><strong id="changeDisplay">₱0.00</strong></div><button class="btn primary full checkout-btn" type="submit">Complete sale <span>→</span></button><p class="form-help center">Stock is deducted only after the sale is saved successfully.</p></div></form></section></div>
+<section class="panel cart-panel"><div class="panel-heading"><div><h3>Current sale</h3><p>Review items before checkout.</p></div><div><button type="button" id="undoCart" class="btn secondary small" disabled title="Undo the latest cart change (Ctrl+Z)">↶ Undo</button> <button type="button" id="clearCart" class="btn ghost small">Clear</button></div></div><?php if(!empty($error)): ?><div class="alert error"><?= e($error) ?></div><?php endif; ?><form method="post" id="checkoutForm"><input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>"><div id="cartItems" class="cart-items"><div class="empty-state compact"><div>＋</div><strong>Your cart is empty</strong><p>Select products to start a sale.</p></div></div><div id="hiddenCart"></div><div class="cart-summary"><div><span>Subtotal</span><strong id="subtotalDisplay">₱0.00</strong></div><div class="discount-line"><label for="discount">Discount (₱)</label><input id="discount" name="discount" type="number" min="0" step="0.01" value="0"></div><div class="total-line"><span>Total due</span><strong id="totalDisplay">₱0.00</strong></div><label for="cashReceived">Cash received (₱)</label><input id="cashReceived" name="cash_received" type="number" min="0" step="0.01" required placeholder="Enter amount received"><div class="change-line"><span>Change</span><strong id="changeDisplay">₱0.00</strong></div><button class="btn primary full checkout-btn" type="submit">Complete sale <span>→</span></button><p class="form-help center">Stock is deducted only after the sale is saved successfully.</p></div></form></section></div>
 <script src="assets/js/pos.js"></script>
 <?php require __DIR__.'/includes/footer.php'; ?>
