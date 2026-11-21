@@ -1,54 +1,123 @@
 <?php
 declare(strict_types=1);
-/** Algorithms operate on PHP arrays fetched from the existing products table. */
-final class InventoryDSA {
-    public static function linearSearch(array $products, string $needle): array {
-        $matches = [];
-        foreach ($products as $product) {
-            if (stripos((string)$product['name'], $needle) !== false || stripos((string)($product['sku'] ?? ''), $needle) !== false || (string)$product['id'] === $needle) {
-                $matches[] = $product;
-            }
+interface InventoryAlgorithm { public function run(array $items, string $argument = ''): array; }
+abstract class CatalogAlgorithm implements InventoryAlgorithm {
+    protected function key(array $row, string $field): string { return (string)($row[$field] ?? ''); }
+    protected function compare(array $a, array $b, string $field): int {
+        if ($field === 'id') return ((int)$a['id']) <=> ((int)$b['id']);
+        if ($field === 'expiration_date') return strcmp($this->key($a,$field) ?: '9999-12-31', $this->key($b,$field) ?: '9999-12-31');
+        return strcasecmp($this->key($a,$field), $this->key($b,$field));
+    }
+}
+final class ExpirationSelectionSort extends CatalogAlgorithm {
+    public function run(array $items, string $argument = ''): array {
+        $n=count($items);
+        for ($i=0; $i<$n-1; $i++) {
+            $min=$i;
+            for ($j=$i+1; $j<$n; $j++) if ($this->compare($items[$j],$items[$min],'expiration_date')<0) $min=$j;
+            if ($min!==$i) { $temp=$items[$i];$items[$i]=$items[$min];$items[$min]=$temp; }
+        }
+        return $items;
+    }
+}
+final class ProductMergeSort extends CatalogAlgorithm {
+    public function run(array $items, string $argument = ''): array {
+        $field=$argument==='id' ? 'id' : 'name';
+        return $this->sort($items,$field);
+    }
+    private function sort(array $items,string $field): array {
+        $n=count($items);if($n<2)return $items;
+        $mid=intdiv($n,2);
+        $left=$this->sort(array_slice($items,0,$mid),$field);
+        $right=$this->sort(array_slice($items,$mid),$field);
+        $out=[];$i=0;$j=0;
+        while($i<count($left)&&$j<count($right)){
+            if($this->compare($left[$i],$right[$j],$field)<=0)$out[]=$left[$i++];
+            else $out[]=$right[$j++];
+        }
+        while($i<count($left))$out[]=$left[$i++];
+        while($j<count($right))$out[]=$right[$j++];
+        return $out;
+    }
+}
+final class ProductLinearSearch extends CatalogAlgorithm {
+    public function run(array $items, string $argument = ''): array {
+        $needle=trim($argument);if($needle==='')return $items;
+        $matches=[];
+        foreach($items as $row){
+            if((string)$row['id']===$needle || stripos((string)$row['name'],$needle)!==false || stripos((string)($row['sku']??''),$needle)!==false){$matches[]=$row;}
         }
         return $matches;
     }
-    public static function mergeSort(array $items, string $field = 'stock_qty'): array {
-        $n = count($items);
-        if ($n < 2) return $items;
-        $mid = intdiv($n, 2);
-        $left = self::mergeSort(array_slice($items, 0, $mid), $field);
-        $right = self::mergeSort(array_slice($items, $mid), $field);
-        $out = []; $i = 0; $j = 0;
-        while ($i < count($left) && $j < count($right)) {
-            $a = $left[$i][$field] ?? null;
-            $b = $right[$j][$field] ?? null;
-            $cmp = $field === 'expiration_date' ? strcmp((string)($a ?? '9999-12-31'), (string)($b ?? '9999-12-31')) : ((float)$a <=> (float)$b);
-            if ($cmp <= 0) $out[] = $left[$i++]; else $out[] = $right[$j++];
+}
+final class CatalogAlgorithmService {
+    public static function execute(InventoryAlgorithm $algorithm,array $items,string $argument=''): array {
+        return $algorithm->run($items,$argument);
+    }
+}
+
+final class LinkedStackNode {
+    public mixed $value;
+    public ?LinkedStackNode $next;
+
+    public function __construct(
+        mixed $value,
+        ?LinkedStackNode $next = null
+    ) {
+        $this->value = $value;
+        $this->next = $next;
+    }
+}
+final class LinkedNodeStack {
+    private ?LinkedStackNode $top=null;
+    public function push(mixed $value): void { $this->top=new LinkedStackNode($value,$this->top); }
+    public function pop(): mixed {
+        if($this->top===null)throw new UnderflowException('Stack is empty');
+        $value=$this->top->value;$this->top=$this->top->next;return $value;
+    }
+    public function isEmpty(): bool {return $this->top===null;}
+    public function peek(): mixed {return $this->top?->value;}
+    /** Visit each linked node without changing the stack. */
+    public function traverse(callable $visitor): void {
+        for($node=$this->top;$node!==null;$node=$node->next)$visitor($node->value);
+    }
+}
+final class PostfixProfitEvaluator {
+    public function evaluate(array $tokens): float {
+        $stack=new LinkedNodeStack();
+        foreach($tokens as $token){
+            if(is_numeric($token)){ $stack->push((float)$token);continue; }
+            if(!in_array($token,['+','-','*','/'],true))throw new InvalidArgumentException('Unknown operator');
+            $right=$stack->pop();$left=$stack->pop();
+            $value=match($token){'+'=>$left+$right,'-'=>$left-$right,'*'=>$left*$right,'/'=>$right!=0 ? $left/$right : throw new DivisionByZeroError()};
+            $stack->push($value);
         }
-        while ($i < count($left)) $out[] = $left[$i++];
-        while ($j < count($right)) $out[] = $right[$j++];
-        return $out;
+        $answer=$stack->pop();
+        if(!$stack->isEmpty())throw new InvalidArgumentException('Invalid postfix expression');
+        return round($answer,2);
     }
-    public static function lowStockTraversal(array $products): array {
-        $low = [];
-        foreach ($products as $product) if ((float)$product['stock_qty'] <= (float)$product['min_stock']) $low[] = $product;
-        return $low;
+    public function lineProfit(float $selling,float $cost,float $qty): float {
+        return $this->evaluate([$selling,$cost,'-',$qty,'*']);
     }
-    public static function inventoryValueSum(array $products): float {
-        $total = 0.0;
-        foreach ($products as $product) $total += (float)$product['stock_qty'] * (float)$product['cost_price'];
-        return round($total, 2);
+}
+final class LinkedProfitReport {
+    public function total(array $saleLines,string $from,string $to): float {
+        $stack=new LinkedNodeStack();$evaluator=new PostfixProfitEvaluator();
+        foreach($saleLines as $line)$stack->push($line);
+        $total=0.0;
+        $stack->traverse(static function(array $line)use(&$total,$evaluator,$from,$to):void {
+            $day=substr((string)$line['sold_at'],0,10);
+            if($day>=$from && $day<=$to){
+                $total+=$evaluator->lineProfit((float)$line['unit_price'],(float)$line['unit_cost'],(float)$line['quantity']);
+            }
+        });
+        return round($total,2);
     }
-    public static function expirationCheck(array $products, int $days = 7): array {
-        $result = [];
-        $today = new DateTimeImmutable('today');
-        $deadline = $today->modify('+' . $days . ' days');
-        foreach ($products as $product) {
-            if ((float)$product['stock_qty'] <= 0 || empty($product['expiration_date'])) continue;
-            $expiry = DateTimeImmutable::createFromFormat('!Y-m-d', (string)$product['expiration_date']);
-            if ($expiry && $expiry <= $deadline) $result[] = $product;
-        }
-        return $result;
-    }
+}
+final class InventoryDSA {
+    public static function linearSearch(array $products,string $needle):array {return (new ProductLinearSearch())->run($products,$needle);}
+    public static function mergeSort(array $items,string $field='name'):array {return (new ProductMergeSort())->run($items,$field);}
+    public static function selectionSort(array $items):array {return (new ExpirationSelectionSort())->run($items);}
 }
 /** Explicit LIFO stack operations; MySQL table persists entries between requests. */
 final class InventoryAdjustmentStack {
