@@ -170,47 +170,27 @@ $categories = $pdo->query('SELECT id,name FROM categories ORDER BY name')->fetch
 $suppliers = $pdo->query('SELECT id,name FROM agent ORDER BY name')->fetchAll();
 
 $search = trim((string)($_GET['q'] ?? ''));
-$stockFilter = $_GET['stock'] ?? '';
-
-$sql = "SELECT p.*,c.name category_name,s.name supplier_name FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN agent s ON s.id=p.supplier_id WHERE p.active=1";
-$args = [];
-
-if ($search !== '') {
-    $sql .= ' AND (p.name LIKE ? OR p.sku LIKE ?)';
-    $args[] = "%$search%";
-    $args[] = "%$search%";
-}
-
-if ($stockFilter === 'low') {
-    $sql .= ' AND p.stock_qty <= p.min_stock';
-}
-
-$sql .= ' ORDER BY p.name LIMIT 500';
-$stmt = $pdo->prepare($sql);
-$stmt->execute($args);
+$stockFilter = (string)($_GET['stock'] ?? '');
+$sortMode = (string)($_GET['sort'] ?? 'name');
+$categoryFilter = (int)($_GET['category'] ?? 0);
+if (!in_array($sortMode, ['name','id','expiry'], true)) $sortMode = 'name';
+// Fetch live records; the catalog's actual search/sort uses our own DSA implementations.
+$stmt = $pdo->query("SELECT p.*,c.name category_name,s.name supplier_name FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN agent s ON s.id=p.supplier_id WHERE p.active=1 ORDER BY p.id LIMIT 5000");
 $products = $stmt->fetchAll();
 
-// Five explicit PHP algorithms operate on the same live MySQL inventory records.
-$dsaMode = (string)($_GET['dsa'] ?? '');
-$dsaQuery = trim((string)($_GET['dsa_query'] ?? ''));
-$dsaRows = [];
-$dsaValue = null;
-$dsaLabels = [
- 'linear' => 'Linear Search', 'merge_stock' => 'Merge Sort (stock quantity)',
- 'merge_expiry' => 'Merge Sort (expiration date)', 'low' => 'List Traversal (low stock)',
- 'sum' => 'Summation (inventory cost value)', 'expiry' => 'Expiration-Date Checking'
-];
-if (isset($dsaLabels[$dsaMode])) {
-    $allProducts = $pdo->query('SELECT id,name,sku,stock_qty,min_stock,cost_price,expiration_date,unit FROM products WHERE active=1')->fetchAll();
-    switch ($dsaMode) {
-        case 'linear': $dsaRows = $dsaQuery !== '' ? InventoryDSA::linearSearch($allProducts, $dsaQuery) : []; break;
-        case 'merge_stock': $dsaRows = InventoryDSA::mergeSort($allProducts); break;
-        case 'merge_expiry': $dsaRows = InventoryDSA::mergeSort($allProducts, 'expiration_date'); break;
-        case 'low': $dsaRows = InventoryDSA::lowStockTraversal($allProducts); break;
-        case 'sum': $dsaValue = InventoryDSA::inventoryValueSum($allProducts); break;
-        case 'expiry': $dsaRows = InventoryDSA::expirationCheck($allProducts); break;
-    }
+if ($categoryFilter > 0) {
+    $products = array_values(array_filter(
+        $products,
+        static fn(array $product): bool =>
+            (int)$product['category_id'] === $categoryFilter
+    ));
 }
+
+if ($search !== '') $products = CatalogAlgorithmService::execute(new ProductLinearSearch(), $products, $search); // B3
+if ($stockFilter === 'low') $products = array_values(array_filter($products,static fn(array $p):bool => (float)$p['stock_qty'] <= (float)$p['min_stock']));
+$products = $sortMode === 'expiry'
+    ? CatalogAlgorithmService::execute(new ExpirationSelectionSort(),$products) // B1
+    : CatalogAlgorithmService::execute(new ProductMergeSort(),$products,$sortMode); // B2
 $stackTop = null;
 $stackError = null;
 if ($isAdmin) {
@@ -252,39 +232,15 @@ require __DIR__ . '/includes/header.php';
 </div>
 
 <div class="panel" id="dsa-tools" style="margin-bottom:20px;">
-    <div class="panel-heading"><div><h3>DSA Inventory Tools</h3><p>One Stack (LIFO) and five PHP algorithms using live inventory data.</p></div></div>
+    <div class="panel-heading"><div><h3>POS stock adjustment history</h3><p>Latest manual stock adjustment can be undone here; POS cart uses its own undo stack.</p></div></div>
     <?php if ($isAdmin): ?>
-        <p><strong>Undo Stack (LIFO):</strong> <?= $stackTop ? 'Latest adjustment: ' . e($stackTop['product_name']) . ' (' . e((string)$stackTop['quantity_change']) . ')' : 'No adjustments available to undo.' ?></p>
+        <p><strong>Latest stock adjustment:</strong> <?= $stackTop ? e($stackTop['product_name']) . ' (' . e((string)$stackTop['quantity_change']) . ')' : 'None available' ?></p>
         <?php if ($stackError): ?><p class="muted"><?= e($stackError) ?></p><?php endif; ?>
-        <form method="post" onsubmit="return confirm('Undo the latest manual stock adjustment?');" style="margin-bottom:16px;">
+        <form method="post" onsubmit="return confirm('Undo the latest manual stock adjustment?');">
             <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
             <input type="hidden" name="action" value="undo_adjustment">
-            <button class="btn secondary" type="submit" <?= !$stackTop ? 'disabled' : '' ?>>Undo Last Adjustment (POP)</button>
+            <button class="btn secondary" type="submit" <?= !$stackTop ? 'disabled' : '' ?>>Undo Last Stock Adjustment</button>
         </form>
-    <?php endif; ?>
-    <form method="get" class="filter-bar">
-        <select name="dsa" aria-label="Choose DSA algorithm">
-            <option value="">Choose an algorithm</option>
-            <?php foreach ($dsaLabels as $key => $label): ?>
-                <option value="<?= e($key) ?>" <?= $dsaMode === $key ? 'selected' : '' ?>><?= e($label) ?></option>
-            <?php endforeach; ?>
-        </select>
-        <input name="dsa_query" value="<?= e($dsaQuery) ?>" placeholder="Product ID, name or SKU for Linear Search">
-        <button class="btn primary" type="submit">Run Algorithm</button>
-    </form>
-    <?php if (isset($dsaLabels[$dsaMode])): ?>
-        <h4><?= e($dsaLabels[$dsaMode]) ?> — Results</h4>
-        <?php if ($dsaValue !== null): ?>
-            <p>Total inventory cost value: <strong><?= money($dsaValue) ?></strong></p>
-        <?php else: ?>
-            <p><?= count($dsaRows) ?> matching product(s). <?= $dsaMode === 'linear' && $dsaQuery === '' ? 'Enter a search term to find products.' : '' ?></p>
-            <div class="table-wrap"><table><thead><tr><th>Product</th><th>SKU</th><th>Stock</th><th>Minimum</th><th>Expiration</th></tr></thead><tbody>
-            <?php foreach (array_slice($dsaRows, 0, 100) as $item): ?>
-                <tr><td><?= e($item['name']) ?></td><td><?= e($item['sku'] ?? '') ?></td><td><?= e((string)$item['stock_qty']) ?></td><td><?= e((string)$item['min_stock']) ?></td><td><?= e($item['expiration_date'] ?? '—') ?></td></tr>
-            <?php endforeach; ?>
-            </tbody></table></div>
-            <?php if (count($dsaRows) > 100): ?><p class="muted">Showing first 100 results.</p><?php endif; ?>
-        <?php endif; ?>
     <?php endif; ?>
 </div>
 
@@ -296,12 +252,29 @@ require __DIR__ . '/includes/header.php';
         </div>
     </div>
     <form class="filter-bar" method="get">
-        <input name="q" value="<?= e($search) ?>" placeholder="Search product name or SKU">
+        <input name="q" value="<?= e($search) ?>" placeholder="Linear search by ID, name or SKU">
+<!-- Category Filter -->
+        <select name="category" aria-label="Filter by category">
+            <option value="0">All categories</option>
+            <?php foreach ($categories as $category): ?>
+                <option
+                    value="<?= (int)$category['id'] ?>"
+                    <?= $categoryFilter === (int)$category['id'] ? 'selected' : '' ?>
+                >
+                    <?= e($category['name']) ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
         <select name="stock">
             <option value="">All stock levels</option>
             <option value="low" <?= $stockFilter === 'low' ? 'selected' : '' ?>>Low stock only</option>
         </select>
-        <button class="btn secondary" type="submit">Search</button>
+        <select name="sort" aria-label="Sort catalog">
+            <option value="name" <?= $sortMode === 'name' ? 'selected' : '' ?>>Merge Sort: Name</option>
+            <option value="id" <?= $sortMode === 'id' ? 'selected' : '' ?>>Merge Sort: Product ID</option>
+            <option value="expiry" <?= $sortMode === 'expiry' ? 'selected' : '' ?>>Selection Sort: Expiration</option>
+        </select>
+        <button class="btn secondary" type="submit">Apply</button>
         <a class="btn ghost" href="products.php">Reset</a>
     </form>
 
@@ -313,7 +286,7 @@ require __DIR__ . '/includes/header.php';
                     <th>Category</th>
                     <th>Cost</th>
                     <th>Selling price</th>
-                    <th>Stock</th>
+                    <th>Stock (Per Piece)</th>
                     <th>Status</th>
                     <th>Actions</th>
                 </tr>
@@ -328,7 +301,8 @@ require __DIR__ . '/includes/header.php';
                         <td><?= e($p['category_name'] ?? 'Uncategorized') ?></td>
                         <td><?= money($p['cost_price']) ?></td>
                         <td><strong><?= money($p['selling_price']) ?></strong></td>
-                        <td><?= e((string)$p['stock_qty']) ?> <small><?= e($p['unit']) ?></small></td>
+                        <td><?= number_format((float)$p['stock_qty'], 0) ?> <small><?= e($p['unit']) ?></small></td>
+
                         <td>
                             <span class="badge <?= (float)$p['stock_qty'] <= 0 ? 'danger' : ($low ? 'warning' : 'success') ?>">
                                 <?= (float)$p['stock_qty'] <= 0 ? 'Out of stock' : ($low ? 'Low stock' : 'In stock') ?>
